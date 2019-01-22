@@ -238,7 +238,7 @@ describe GContacts::Element do
             'gd:region' => 'Krypton',
             '@rel' => 'http://schemas.google.com/g/2005#home'
           },
-           {
+          {
              'gd:formattedAddress' => "Nokia Lumia 720\nFinland\nEarth",
              'gd:street' => 'Nokia Limia 720',
              'gd:city' => 'Finland',

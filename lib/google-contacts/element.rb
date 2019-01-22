@@ -1,13 +1,15 @@
 require 'net/http'
 
+# GContacts::Element
 module GContacts
   class Element
     attr_accessor :addresses, :birthday, :content, :data, :category, :emails,
-                  :etag, :fax_numbers, :groups, :group_id, :hashed_addresses,
-                  :hashed_email_addresses, :hashed_fax_numbers,
-                  :hashed_phone_numbers, :hashed_mobile_numbers,
-                  :hashed_websites, :mobiles, :name, :organization,
-                  :org_name, :org_title, :phones, :title, :websites
+                  :entry, :etag, :fax_numbers, :groups, :group_id,
+                  :hashed_addresses, :hashed_email_addresses,
+                  :hashed_fax_numbers, :hashed_phone_numbers,
+                  :hashed_mobile_numbers, :hashed_websites, :mobiles, :name,
+                  :organization, :org_name, :org_title, :phones, :title,
+                  :websites
     attr_reader :batch, :edit_uri, :id, :modifier_flag, :photo_uri, :updated
 
     ##
@@ -18,6 +20,7 @@ module GContacts
     def initialize(entry = nil)
       @data = {}
       return unless entry
+      @entry = entry
 
       @id = entry['id']
       @updated = entry['updated']
@@ -27,232 +30,14 @@ module GContacts
       @name = entry['gd:name']
       @organization = entry['gd:organization']
 
-      @photo_uri = nil
-      if entry['category']
-        @category = entry['category']['@term'].split('#', 2).last
-        entry['category']['@label'] &&
-          @category_tag = entry['category']['@label']
-      end
-
-      # Parse out all the relevant data
-      entry.each do |key, unparsed|
-        if key =~ /^(gd:|gContact:)/
-          @data[key] = if unparsed.is_a?(Array)
-                         unparsed.map { |v| parse_element(v) }
-                       else
-                         [parse_element(unparsed)]
-                       end
-        elsif key =~ /^batch:(.+)/
-          @batch ||= {}
-
-          if Regexp.last_match(1) == 'interrupted'
-            @batch['status'] = 'interrupted'
-            @batch['code'] = '400'
-            @batch['reason'] = unparsed['@reason']
-            @batch['status'] = {
-              'parsed' => unparsed['@parsed'].to_i,
-              'success' => unparsed['@success'].to_i,
-              'error' => unparsed['@error'].to_i,
-              'unprocessed' => unparsed['@unprocessed'].to_i
-            }
-          elsif Regexp.last_match(1) == 'id'
-            @batch['status'] = unparsed
-          elsif Regexp.last_match(1) == 'status'
-            if unparsed.is_a?(Hash)
-              @batch['code'] = unparsed['@code']
-              @batch['reason'] = unparsed['@reason']
-            else
-              @batch['code'] = unparsed.attributes['code']
-              @batch['reason'] = unparsed.attributes['reason']
-            end
-
-          elsif Regexp.last_match(1) == 'operation'
-            @batch['operation'] = unparsed['@type']
-          end
-        end
-      end
-
-      @groups = []
-      if (groups = [entry['gContact:groupMembershipInfo']])
-        groups.flatten.compact.each do |group|
-          @modifier_flag = :delete if group['@deleted'] == 'true'
-          @groups << {
-            group_id: group['@href'].split('/').pop, group_href: group['@href']
-          }
-        end
-      end
-
-      # Need to know where to send the update request
-      if entry['link'].is_a?(Array)
-        entry['link'].each do |link|
-          if link['@rel'] == 'edit'
-            @edit_uri = URI(link['@href'])
-          elsif link['@rel'].match(/rel#photo$/) && !link['@gd:etag'].nil?
-            @photo_uri = URI(link['@href'])
-          end
-        end
-      end
-
-      @emails = []
-      nodes = if entry['gd:email'].is_a?(Array)
-                entry['gd:email']
-              elsif !entry['gd:email'].nil?
-                [entry['gd:email']]
-              else
-                []
-              end
-
-      nodes.each do |email|
-        new_email = {}
-        new_email['address'] = email['@address']
-        new_email['type'] = if email['@rel'].nil?
-                              email['@label']
-                            else
-                              get_google_label_name(email['@rel'])
-                            end
-
-        @emails << new_email
-      end
-
-      @phones = []
-      @mobiles = []
-      @fax_numbers = []
-      nodes = if entry['gd:phoneNumber'].is_a?(Array)
-                entry['gd:phoneNumber']
-              elsif !entry['gd:phoneNumber'].nil?
-                [entry['gd:phoneNumber']]
-              else
-                []
-              end
-
-      nodes.each do |phone|
-        next unless phone.respond_to? :attributes
-        new_phone = {}
-        new_phone['text'] = phone
-        google_category = if phone.attributes['rel'].nil?
-                            phone.attributes['label']
-                          else
-                            get_google_label_name(phone.attributes['rel'])
-                          end
-
-        new_phone['@rel'] = google_category
-        if google_category.downcase.include?('mobile')
-          @mobiles << new_phone
-        elsif google_category.downcase.include?('fax')
-          @fax_numbers << new_phone
-        else
-          @phones << new_phone
-        end
-      end
-
-      @addresses = []
-      nodes = if entry['gd:structuredPostalAddress'].is_a?(Array)
-                entry['gd:structuredPostalAddress']
-              elsif !entry['gd:structuredPostalAddress'].nil?
-                [entry['gd:structuredPostalAddress']]
-              else
-                []
-              end
-
-      nodes.each do |address|
-        new_address = {}
-        new_address['address']        = address['gd:formattedAddress']
-        new_address['address_line']   = address['gd:street']
-        new_address['geo_city']       = address['gd:city']
-        new_address['geo_state']      = address['gd:region']
-        new_address['zipcode']        = address['gd:postcode']
-        new_address['address_line_2'] = address['gd:neighborhood']
-        new_address['pobox']          = address['gd:pobox']
-        country = address['gd:country']
-        new_address['country']      =
-          case country.class.name
-          when 'String', 'Nori::StringWithAttributes'
-            country.attributes['code'] || country
-          when 'Hash'
-            country['@code']
-          end
-        unless address['@rel'].nil?
-          new_address['type'] = get_google_label_name(address['@rel'])
-        else
-          new_address['type'] = address['@label']
-        end
-
-        @addresses << new_address
-      end
-
-      @hashed_email_addresses = {}
-      if @emails.any?
-        @emails.each do |email|
-          type = email['type']
-          text = email['address']
-          @hashed_email_addresses[type] = [] unless @hashed_email_addresses[type]
-          @hashed_email_addresses[type] << text
-        end
-      end
-
-      @hashed_addresses = {}
-      if @addresses.any?
-        @addresses.each do |address|
-          type = address['type']
-          @hashed_addresses[type] = [] unless @hashed_addresses[type]
-          @hashed_addresses[type] << {
-            address:        address['address'],
-            address_line:   address['address_line'],
-            geo_city:       address['geo_city'],
-            geo_state:      address['geo_state'],
-            zipcode:        address['zipcode'],
-            country:        address['country'],
-            address_line_2: address['address_line_2'],
-            pobox:          address['pobox']
-          }
-        end
-      end
-
-      @hashed_phone_numbers = {}
-      @phones.each do |phone|
-        type = phone['@rel']
-        text = phone['text']
-        @hashed_phone_numbers[type] = [] unless @hashed_phone_numbers[type]
-        @hashed_phone_numbers[type] << text
-      end
-
-      @hashed_mobile_numbers = {}
-      @mobiles.each do |mobile|
-        type = mobile['@rel']
-        text = mobile['text']
-        @hashed_mobile_numbers[type] = [] unless @hashed_mobile_numbers[type]
-        @hashed_mobile_numbers[type] << text
-      end
-
-      @hashed_fax_numbers = {}
-      @fax_numbers.each do |fax|
-        type = fax['@rel']
-        text = fax['text']
-        @hashed_fax_numbers[type] = [] unless @hashed_fax_numbers[type]
-        @hashed_fax_numbers[type] << text
-      end
-
-      @websites = []
-      nodes = if entry['gContact:website'].is_a?(Array)
-                entry['gContact:website']
-              elsif !entry['gContact:website'].nil?
-                [entry['gContact:website']]
-              else
-                []
-              end
-
-      nodes.each do |website|
-        new_website = {}
-        new_website['gContact:website'] = website['@href']
-        new_website['type'] = if website['@rel'].nil?
-                                website['@label']
-                              else
-                                website['@rel']
-                              end
-        @websites << new_website
-      end
-
-      organize_websites
+      process_element
+      assign_addresses
+      assign_category
+      assign_email_addresses
+      assign_groups
+      assign_phone_and_fax_numbers
+      assign_photo_uri
+      assign_websites
       organize_birthdays(@data['gContact:birthday'])
       organization_details
     end
@@ -331,12 +116,227 @@ module GContacts
 
       data['gContact:groupMembershipInfo'] = []
       group_links.each do |group_link|
-        params = { '@deleted' => 'false', '@href' => group_link.to_s }
+        params = {
+          '@deleted' => 'false',
+          '@href' => group_link.to_s
+        }
         data['gContact:groupMembershipInfo'] << params
       end
     end
 
     private
+
+    def assign_addresses
+      @addresses = []
+      nodes = if entry['gd:structuredPostalAddress'].is_a?(Array)
+                entry['gd:structuredPostalAddress']
+              elsif !entry['gd:structuredPostalAddress'].nil?
+                [entry['gd:structuredPostalAddress']]
+              else
+                []
+              end
+      nodes.each do |address|
+        new_address = {}
+        new_address['address']        = address['gd:formattedAddress']
+        new_address['address_line']   = address['gd:street']
+        new_address['geo_city']       = address['gd:city']
+        new_address['geo_state']      = address['gd:region']
+        new_address['zipcode']        = address['gd:postcode']
+        new_address['address_line_2'] = address['gd:neighborhood']
+        new_address['pobox']          = address['gd:pobox']
+        country = address['gd:country']
+        new_address['country'] =
+          case country.class.name
+          when 'String', 'Nori::StringWithAttributes'
+            country.attributes['code'] || country
+          when 'Hash'
+            country['@code']
+          end
+        new_address['type'] = if address['@rel'].nil?
+                                address['@label']
+                              else
+                                get_google_label_name(address['@rel'])
+                              end
+
+        @addresses << new_address
+      end
+      organize_addresses
+    end
+
+    def organize_addresses
+      @hashed_addresses = {}
+      @addresses.each do |address|
+        type = address['type']
+        @hashed_addresses[type] = [] unless @hashed_addresses[type]
+        @hashed_addresses[type] << {
+          address:        address['address'],
+          address_line:   address['address_line'],
+          geo_city:       address['geo_city'],
+          geo_state:      address['geo_state'],
+          zipcode:        address['zipcode'],
+          country:        address['country'],
+          address_line_2: address['address_line_2'],
+          pobox:          address['pobox']
+        }
+      end
+    end
+
+    def assign_category
+      return unless entry['category']
+      @category = entry['category']['@term'].split('#', 2).last
+      @category_tag = entry['category']['@label'] if entry['category']['@label']
+    end
+
+    def assign_email_addresses
+      @emails = []
+      nodes = if entry['gd:email'].is_a?(Array)
+                entry['gd:email']
+              elsif !entry['gd:email'].nil?
+                [entry['gd:email']]
+              else
+                []
+              end
+
+      nodes.each do |email|
+        new_email = {}
+        new_email['address'] = email['@address']
+        new_email['type'] = if email['@rel'].nil?
+                              email['@label']
+                            else
+                              get_google_label_name(email['@rel'])
+                            end
+
+        @emails << new_email
+      end
+      organize_emails
+    end
+
+    def organize_emails
+      @hashed_email_addresses = {}
+      @emails.each do |email|
+        type = email['type']
+        text = email['address']
+        @hashed_email_addresses[type] = [] unless @hashed_email_addresses[type]
+        @hashed_email_addresses[type] << text
+      end
+    end
+
+    def assign_groups
+      @groups = []
+      groups = [entry['gContact:groupMembershipInfo']]
+      return unless groups
+      groups.flatten.compact.each do |group|
+        @modifier_flag = :delete if group['@deleted'] == 'true'
+        @groups << {
+          group_id: group['@href'].split('/').pop,
+          group_href: group['@href']
+        }
+      end
+    end
+
+    def assign_phone_and_fax_numbers
+      @phones = []
+      @mobiles = []
+      @fax_numbers = []
+      nodes = if entry['gd:phoneNumber'].is_a?(Array)
+                entry['gd:phoneNumber']
+              elsif !entry['gd:phoneNumber'].nil?
+                [entry['gd:phoneNumber']]
+              else
+                []
+              end
+
+      nodes.each do |phone|
+        next unless phone.respond_to? :attributes
+        new_phone = {}
+        new_phone['text'] = phone
+        google_category = if phone.attributes['rel'].nil?
+                            phone.attributes['label']
+                          else
+                            get_google_label_name(phone.attributes['rel'])
+                          end
+
+        new_phone['@rel'] = google_category
+        if google_category.downcase.include?('mobile')
+          @mobiles << new_phone
+        elsif google_category.downcase.include?('fax')
+          @fax_numbers << new_phone
+        else
+          @phones << new_phone
+        end
+      end
+      organize_phone_numbers
+      organize_mobile_numbers
+      organize_fax_numbers
+    end
+
+    def assign_photo_uri
+      @photo_uri = nil
+      # Need to know where to send the update request
+      if entry['link'].is_a?(Array)
+        entry['link'].each do |link|
+          if link['@rel'] == 'edit'
+            @edit_uri = URI(link['@href'])
+          elsif link['@rel'].match(/rel#photo$/) && !link['@gd:etag'].nil?
+            @photo_uri = URI(link['@href'])
+          end
+        end
+      end
+    end
+
+    def organize_phone_numbers
+      @hashed_phone_numbers = {}
+      @phones.each do |phone|
+        type = phone['@rel']
+        text = phone['text']
+        @hashed_phone_numbers[type] = [] unless @hashed_phone_numbers[type]
+        @hashed_phone_numbers[type] << text
+      end
+    end
+
+    def organize_mobile_numbers
+      @hashed_mobile_numbers = {}
+      @mobiles.each do |mobile|
+        type = mobile['@rel']
+        text = mobile['text']
+        @hashed_mobile_numbers[type] = [] unless @hashed_mobile_numbers[type]
+        @hashed_mobile_numbers[type] << text
+      end
+    end
+
+    def organize_fax_numbers
+      @hashed_fax_numbers = {}
+      @fax_numbers.each do |fax|
+        type = fax['@rel']
+        text = fax['text']
+        @hashed_fax_numbers[type] = [] unless @hashed_fax_numbers[type]
+        @hashed_fax_numbers[type] << text
+      end
+    end
+
+    def assign_websites
+      @websites = []
+      nodes = if entry['gContact:website'].is_a?(Array)
+                entry['gContact:website']
+              elsif !entry['gContact:website'].nil?
+                [entry['gContact:website']]
+              else
+                []
+              end
+
+      nodes.each do |website|
+        new_website = {}
+        new_website['gContact:website'] = website['@href']
+        new_website['type'] =
+          if website['@rel'].nil?
+            website['@label']
+          else
+            website['@rel']
+          end
+        @websites << new_website
+      end
+      organize_websites
+    end
 
     def get_google_label_name(google_type)
       google_type.split('#').last.tr('_', ' ')
@@ -375,12 +375,50 @@ module GContacts
 
     def organize_websites
       @hashed_websites = {}
-      if @websites.any?
-        @websites.each do |website|
-          href = website['gContact:website']
-          type = website['type']
-          @hashed_websites[type] = [] unless @hashed_websites[type]
-          @hashed_websites[type] << href
+      @websites.each do |website|
+        href = website['gContact:website']
+        type = website['type']
+        @hashed_websites[type] = [] unless @hashed_websites[type]
+        @hashed_websites[type] << href
+      end
+    end
+
+    # Parse out all the relevant data
+    def process_element
+      entry.each do |key, unparsed|
+        if key =~ /^(gd:|gContact:)/
+          @data[key] = if unparsed.is_a?(Array)
+                         unparsed.map { |v| parse_element(v) }
+                       else
+                         [parse_element(unparsed)]
+                       end
+        elsif key =~ /^batch:(.+)/
+          @batch ||= {}
+
+          if Regexp.last_match(1) == 'interrupted'
+            @batch['status'] = 'interrupted'
+            @batch['code'] = '400'
+            @batch['reason'] = unparsed['@reason']
+            @batch['status'] = {
+              'parsed' => unparsed['@parsed'].to_i,
+              'success' => unparsed['@success'].to_i,
+              'error' => unparsed['@error'].to_i,
+              'unprocessed' => unparsed['@unprocessed'].to_i
+            }
+          elsif Regexp.last_match(1) == 'id'
+            @batch['status'] = unparsed
+          elsif Regexp.last_match(1) == 'status'
+            if unparsed.is_a?(Hash)
+              @batch['code'] = unparsed['@code']
+              @batch['reason'] = unparsed['@reason']
+            else
+              @batch['code'] = unparsed.attributes['code']
+              @batch['reason'] = unparsed.attributes['reason']
+            end
+
+          elsif Regexp.last_match(1) == 'operation'
+            @batch['operation'] = unparsed['@type']
+          end
         end
       end
     end
@@ -402,8 +440,8 @@ module GContacts
       xml = ' ' * indent
       xml << '<' << tag
 
-      # Need to check for any additional attributes to attach
-      # since they can be mixed in
+      # Need to check for any additional attributes to
+      # attach since they can be mixed in
       misc_keys = 0
       if data.is_a?(Hash)
         misc_keys = data.length
